@@ -1,0 +1,268 @@
+name: Quality Pipeline
+
+on:
+  pull_request:
+    branches: ["main"]
+    types: [opened, reopened]
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: write
+  actions: read
+  checks: write
+  
+jobs:
+  quality-check:
+    runs-on: ubuntu-latest
+    permissions:
+          pull-requests: write
+          contents: read
+          security-events: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # --- TESTS ---
+      - name: Run Tests with Maven (Selenium + TestNG)
+        id: tests
+        run: |
+          mvn clean test > test-log.txt 2>&1 || echo "tests_failed=true" >> $GITHUB_OUTPUT
+
+      # --- ARTEFACTOS Y LOGS ---
+      - name: Generate dynamic artifact name
+        id: artifact-name
+        run: |
+          DATETIME=$(date +'%Y-%m-%d_%H-%M-%S')
+          if [ "${{ github.event_name}}"=="pull_request" ]; then
+            PR_NUMBER="pr-${{ github.event.pull_request.number }}"
+          else
+            PR_NUMBER="no-pr"
+          fi
+  
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+  
+          ARTIFACT_NAME="build-${DATETIME}-${PR_NUMBER}-${SHORT_SHA}"
+  
+          echo "artifact_name=${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
+          echo "Generated artifact name: ${ARTIFACT_NAME}"
+          
+      - name: Upload test logs
+        id: artifact-upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.artifact_name}}
+          path: test-log.txt
+        continue-on-error: true
+
+      - name: Comment test result on PR (if failed)
+        if: contains(steps.tests.outputs.tests_failed, 'true')
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          header: Tests Report
+          message: |
+            ❌ **Tests Failed**
+            Revisa los logs adjuntos. Si es Selenium, valida el WebDriver o los Waits.
+            [Click here to download](${{ steps.artifact-upload.outputs.artifact-url}})
+        continue-on-error: true
+
+      - name: Close Pull
+        if: contains(steps.tests.outputs.tests_failed, 'true')
+        uses: peter-evans/close-pull@v3
+        with:
+          pull-request-number: ${{ github.event.pull_request.number }}
+          comment: Auto-closing pull request
+      
+      - name: Stop if tests failed
+        if: contains(steps.tests.outputs.tests_failed, 'true')
+        run: exit 1
+
+      # --- OWASP DEPENDENCY CHECK ---
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: "MyProject"
+          path: "."
+          format: "HTML"
+        env:
+          # actions/setup-java@v1 changes JAVA_HOME so it needs to be reset to match the depcheck image
+          JAVA_HOME: /opt/jdk
+        continue-on-error: true
+
+      - name: Upload OWASP Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: reports/
+
+      # --- SEMGREP (Seguridad SAST) ---
+      - name: Run Semgrep Security Scan
+        id: semgrep
+        run: |
+          # Instalamos semgrep usando pip (Python ya viene en ubuntu-latest)
+          python3 -m pip install semgrep
+          
+          echo "Running Semgrep..."
+          # Ejecutamos el escaneo:
+          # --config="p/java": Usa las reglas oficiales de seguridad para Java
+          # --config="p/owasp-top-ten": Reglas específicas de OWASP
+          # --error: Falla el paso (exit 1) si encuentra problemas
+          # --json > semgrep-results.json: Guarda reporte para subirlo luego
+          
+          semgrep scan --config="p/java" --config="p/owasp-top-ten" --json -o semgrep-results.json . || echo "semgrep_failed=true" >> $GITHUB_OUTPUT
+
+      - name: Upload Semgrep Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-report
+          path: semgrep-results.json
+
+      - name: Close PR due to Critical Security Issues (Semgrep)
+        if: contains(steps.semgrep.outputs.semgrep_failed, 'true')
+        uses: peter-evans/close-pull@v3
+        with:
+          pull-request-number: ${{ github.event.pull_request.number }}
+          comment: "🛑 Semgrep encontró vulnerabilidades de seguridad en el código Java. PR Cerrado."
+
+      - name: Stop if Semgrep failed
+        if: contains(steps.semgrep.outputs.semgrep_failed, 'true')
+        run: exit 1
+
+      # --- TRUFFLEHOG (Secretos) ---
+      - name: TruffleHog Secret Scan
+        id: trufflehog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+          extra_args: --json
+        continue-on-error: true
+
+      - name: Upload TruffleHog Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trufflehog-report
+          path: trufflehog-report.json
+        if: always()
+        continue-on-error: true
+
+      - name: Close PR due to exposed secrets
+        if: contains(steps.trufflehog.outputs.secrets_found, 'true')
+        uses: peter-evans/close-pull@v3
+        with:
+          pull-request-number: ${{ github.event.pull_request.number }}
+          comment: "🚨 Se detectaron secretos expuestos. PR cerrado automáticamente."
+
+      - name: Stop if secrets were found
+        if: contains(steps.trufflehog.outputs.secrets_found, 'true')
+        run: exit 1
+
+      # --- QODANA (Reemplaza a SonarCloud) ---
+      #- name: SonarCloud Scan
+      #  id: sonarscan
+      #  run: |
+      #    mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+      #    -Dsonar.host.url="https://sonarcloud.io" \
+      #    -Dsonar.login="${{ secrets.SONAR_TOKEN }}" \
+      #    -Dsonar.organization="${{ vars.SONAR_ORG }}" \
+      #    -Dsonar.projectKey="${{ vars.SONAR_PROJECT_KEY }}"
+
+      #- name: SonarCloud Quality Gate
+      #  id: qualitygate
+      #  uses: sonarsource/sonarqube-quality-gate-action@v1.1.0
+      #  with:
+      #    scanMetadataReportFile: target/sonar/report-task.txt
+      #  env:
+      #    SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      #    SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      #- name: Comment SonarCloud Result
+      #  uses: marocchino/sticky-pull-request-comment@v2
+      #  with:
+      #    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #    header: SonarCloud Report
+      #    message: |
+      #      🔍 **Resultado de Análisis SonarCloud**
+      #      - Estado Quality Gate: **${{ steps.qualitygate.outputs.quality-gate-status }}**
+      #      📌 Ver el informe completo en SonarCloud.
+
+      #- name: Fail if Quality Gate Failed
+      #  if: steps.qualitygate.outputs.quality-gate-status != 'PASSED'
+      #  run: exit 1
+      - name: Qodana Scan (Quality Gate)
+        id: qodana
+        uses: jetbrains/qodana-action@v2023.3
+        with:
+          # Qodana detectó Java automáticamente, pero lo dejamos explícito por seguridad
+          args: --linter,jetbrains/qodana-jvm-community,--fail-threshold,0
+          upload-result: true 
+          # Nombre del artefacto que aparecerá en GitHub
+          artifact-name: qodana-report
+        continue-on-error: true # Dejamos que continúe para subir el reporte y comentar
+
+      - name: Upload Qodana Report (HTML)
+        uses: actions/upload-artifact@v4
+        with:
+          name: qodana-report
+          # Qodana guarda el reporte HTML en esta ruta por defecto
+          path: ${{ runner.temp }}/qodana/report
+        if: always()
+        continue-on-error: true
+
+      - name: Comment Qodana Result
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          header: Quality Report (Qodana)
+          message: |
+            🔍 **Resultado de Calidad de Código (Qodana)**
+            
+            Estado: ${{ steps.qodana.outcome == 'success' && '✅ PASSED' || '❌ FAILED' }}
+            
+            Se ha generado un reporte HTML detallado. 
+            Descarga el artefacto `qodana-report` de este Run para verlo.
+          continue-on-error: true
+
+      - name: Close PR due to problems (Qodana)
+        if: steps.qodana.outcome == 'failure'
+        uses: peter-evans/close-pull@v3
+        with:
+          pull-request-number: ${{ github.event.pull_request.number }}
+          comment: "🚨 Se detectaron errores. PR cerrado automáticamente."
+      
+      - name: Fail pipeline if Qodana found issues
+        if: steps.qodana.outcome == 'failure'
+        run: exit 1
+        
+      - name: 'Qodana Scan (Cloud)'
+        id: qodana-cloud
+        uses: JetBrains/qodana-action@v2025.2
+        with:
+          pr-mode: false
+          args: --fail-threshold, 1
+        env:
+          QODANA_TOKEN: ${{ secrets.QODANA_TOKEN_262715024 }}
+          QODANA_ENDPOINT: 'https://qodana.cloud'
+        continue-on-error: true
+
+      - name: Close PR due problems (Qodana Cloud)
+        if: steps.qodana-cloud.outcome == 'failure'
+        uses: peter-evans/close-pull@v3
+        with:
+          pull-request-number: ${{ github.event.pull_request.number }}
+          comment: "🚨 Se detectaron errores. PR cerrado automáticamente."
+          
+      - name: Fail pipeline if Qodana found issues
+        if: steps.qodana-cloud.outcome == 'failure'
+        run: exit 1

@@ -1,0 +1,57 @@
+<!DOCTYPE suite SYSTEM "https://testng.org/testng-1.0.dtd">
+<suite name="EPS Web Testing Suite" parallel="tests" thread-count="2">
+    
+    <!-- Default parameters for all tests -->
+    <parameter name="browser" value="firefox"/>
+    <parameter name="headless" value="true"/>
+    <parameter name="baseUrl" value="https://www.upo.es/escuela-politecnica-superior/es/"/>
+    
+    <!-- Smoke Test Suite - Quick critical tests -->
+    <test name="Smoke Tests">
+        <groups>
+            <run>
+                <include name="smoke"/>
+            </run>
+        </groups>
+        <packages>
+            <package name="upo.eps.tests"/>
+        </packages>
+    </test>
+    
+    <!-- Regression Test Suite - Full coverage -->
+    <!-- <test name="Regression Tests">
+        <groups>
+            <run>
+                <include name="regression"/>
+            </run>
+        </groups>
+        <packages>
+            <package name="upo.eps.tests"/>
+        </packages>
+    </test> -->
+    
+    <!-- Home Page Feature Suite -->
+    <test name="Home Page Tests">
+        <groups>
+            <run>
+                <include name="homepage"/>
+            </run>
+        </groups>
+        <classes>
+            <class name="upo.eps.tests.EpsHomePageTest"/>
+        </classes>
+    </test>
+    
+    <!-- Logo Feature Suite -->
+    <test name="Logo Tests">
+        <groups>
+            <run>
+                <include name="logo"/>
+            </run>
+        </groups>
+        <classes>
+            <class name="upo.eps.tests.LogoTestRefactored"/>
+        </classes>
+    </test>
+    
+</suite>
